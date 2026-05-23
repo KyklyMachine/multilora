@@ -5,13 +5,31 @@ Run once per server configuration (different number of adapters, rank, target
 modules, etc.), stamp the config into `meta`, then concatenate the returned
 DataFrames across runs into a single comparison table.
 
+Prompt construction is delegated to the project's existing `VLM_Runner`
+(`vlm_inference.VLM_Runner`) so the same yaml prompts, image handling
+(`utils.image_utils.load_image`) and message formatting
+(`utils.prompt_processing.get_openai_prompt`) used in production also drive
+the benchmark — no duplicate / divergent prompt logic.
+
 Example:
     inputs = list(zip(df["text_value"], df["local_image_path"]))
+
+    runner = VLM_Runner(
+        model_name="qwen_inference",
+        exp_name="_lora_bench",
+        work_dir=WORK_DIR,
+        is_rus=True,
+        continue_if_exists=False,
+        model_path=LLM_PATH,
+        save_results=False,
+    )
+    build_prompt = build_prompt_for_project(runner, "ml_audit_sgc_photo_title_mismatch")
 
     df_small = run_benchmark(
         client=vllm_client,
         adapters=["a1", "a2"],
         inputs=inputs,
+        build_prompt=build_prompt,
         meta={"n_loras": 2, "rank": 8, "target_modules": "qkv"},
         concurrency=64,
     )
@@ -19,6 +37,7 @@ Example:
         client=vllm_client,
         adapters=["a1", "a2", "a3", "a4"],
         inputs=inputs,
+        build_prompt=build_prompt,
         meta={"n_loras": 4, "rank": 16, "target_modules": "qkv"},
         concurrency=64,
     )
@@ -37,18 +56,35 @@ import pandas as pd
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm_asyncio
 
+from vlm_inference import VLM_Runner
+
 
 logger = logging.getLogger(__name__)
 
 
-def default_build_prompt(
-    text: str = "", img_url: Optional[str] = None
-) -> List[Dict[str, Any]]:
-    """Minimal OpenAI chat message: text plus optional image as one user turn."""
-    user_content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
-    if img_url:
-        user_content.append({"type": "image_url", "image_url": {"url": img_url}})
-    return [{"role": "user", "content": user_content}]
+def build_prompt_for_project(
+    runner: VLM_Runner,
+    project_tag: str,
+) -> Callable[..., List[Dict[str, Any]]]:
+    """Configure `runner` for `project_tag` and return its prompt builder.
+
+    Loads the prompt yaml via `runner.set_project_tag` (which internally
+    selects between `get_openai_prompt` / `get_internvl_prompt` based on
+    `model_name`) and returns the resulting callable, ready to be passed as
+    `build_prompt=` to `run_benchmark`.
+
+    Args:
+        runner: Configured `VLM_Runner` (same instance you would use for
+            `run_openai_client`).
+        project_tag: Task identifier; selects the prompt yaml under
+            `{runner.work_dir}/prompts/{runner.model_name}/{project_tag}.yaml`.
+
+    Returns:
+        Callable with signature `(text=..., img_url=...) -> messages`, with
+        local-image / URL handling already baked in via project utilities.
+    """
+    runner.set_project_tag(project_tag)
+    return runner.build_prompt
 
 
 async def _call(
@@ -115,7 +151,7 @@ async def benchmark_loras(
     client: AsyncOpenAI,
     adapters: List[str],
     inputs: List[Tuple[str, Optional[str]]],
-    build_prompt: Callable[..., List[Dict[str, Any]]] = default_build_prompt,
+    build_prompt: Callable[..., List[Dict[str, Any]]],
     concurrency: int = 64,
     max_tokens: int = 1,
     meta: Optional[Dict[str, Any]] = None,
@@ -132,7 +168,8 @@ async def benchmark_loras(
         adapters: LoRA names registered in vLLM (`--lora-modules name=path ...`).
         inputs: List of `(text, img_url)` pairs to use as load.
         build_prompt: Callable returning OpenAI chat messages from `text=` and
-            `img_url=` kwargs. Defaults to a minimal user-turn builder.
+            `img_url=` kwargs. Use `build_prompt_for_project(runner, project_tag)`
+            to obtain it from a configured `VLM_Runner`.
         concurrency: Max in-flight requests across all adapters and inputs.
         max_tokens: Generation cap. Use 1 if only the first decoder hidden
             state / embedding is consumed downstream.
@@ -205,7 +242,7 @@ def run_benchmark(
     client: AsyncOpenAI,
     adapters: List[str],
     inputs: List[Tuple[str, Optional[str]]],
-    build_prompt: Callable[..., List[Dict[str, Any]]] = default_build_prompt,
+    build_prompt: Callable[..., List[Dict[str, Any]]],
     concurrency: int = 64,
     max_tokens: int = 1,
     meta: Optional[Dict[str, Any]] = None,
