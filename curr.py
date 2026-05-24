@@ -14,14 +14,17 @@ Usage:
     from openai import AsyncOpenAI
     from lora_benchmark import benchmark_lora_sweep
 
+    # build_prompt is the same partial you already have in VLM_Runner
+    runner = VLM_Runner(...)
+    runner.set_project_tag("my_task")
+
     client = AsyncOpenAI(base_url="http://localhost:8000/v1", api_key="token")
-    inputs = list(zip(texts, image_urls))   # image_urls can be None
+    inputs = list(zip(texts, image_urls))   # image_urls / video_urls or None
 
     summary_df, per_lora_df = benchmark_lora_sweep(
         client=client,
+        build_prompt=runner.build_prompt,
         all_lora_names=["lora_a", "lora_b", "lora_c", "lora_d"],
-        system_prompt="You are a content classifier.",
-        user_prompt="Classify the following: ",
         inputs=inputs,
         lora_counts=[1, 2, 4],
         n_repeats=10,
@@ -35,13 +38,11 @@ import statistics
 import time
 from asyncio import Semaphore
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 from openai import AsyncOpenAI
 from tqdm.asyncio import tqdm_asyncio
-
-from utils.async_openai_utils import create_request
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,7 @@ class BenchmarkConfig:
     """Settings for a single benchmark run."""
 
     lora_names: List[str]       # adapter names as passed to --lora-modules
-    system_prompt: str
-    user_prompt: str
+    build_prompt: Callable      # same partial used in VLM_Runner: (text, img_url) → messages
     max_tokens: int = 16
     temperature: float = 0.0    # deterministic → stable latency measurements
     concurrency: int = 512      # semaphore cap; keep >= n_loras * n_samples
@@ -179,8 +179,8 @@ async def run_benchmark(
     Args:
         client:  AsyncOpenAI pointing at vLLM (base_url="http://localhost:8000/v1").
         config:  Benchmark settings.
-        inputs:  List of (text, img_url) pairs. img_url can be None for text-only.
-                 For video inputs pass the video URL — vLLM routes it accordingly.
+        inputs:  List of (text, img_url) pairs. img_url can be None for text-only
+                 or a video URL — vLLM routes it accordingly.
 
     Returns:
         global_stats: Dict with aggregate metrics for this run.
@@ -193,12 +193,7 @@ async def run_benchmark(
             client=client,
             sem=sem,
             lora_name=lora_name,
-            messages=create_request(
-                system_prompt=config.system_prompt,
-                user_prompt=config.user_prompt,
-                text=text,
-                img_url=img_url,
-            ),
+            messages=config.build_prompt(text=text, img_url=img_url),
             max_tokens=config.max_tokens,
             temperature=config.temperature,
         )
@@ -243,9 +238,8 @@ async def run_benchmark(
 
 def benchmark_lora_sweep(
     client: AsyncOpenAI,
+    build_prompt: Callable,
     all_lora_names: List[str],
-    system_prompt: str,
-    user_prompt: str,
     inputs: List[Tuple[str, Optional[str]]],
     lora_counts: Optional[List[int]] = None,
     n_repeats: int = 1,
@@ -259,9 +253,9 @@ def benchmark_lora_sweep(
 
     Args:
         client:          AsyncOpenAI client.
+        build_prompt:    Prompt builder — the same partial from VLM_Runner.build_prompt.
+                         Signature: (text, img_url) → List[Dict] (OpenAI messages).
         all_lora_names:  All available LoRA names (registered via --lora-modules).
-        system_prompt:   Fixed system prompt for all requests.
-        user_prompt:     Fixed user prompt prefix (text from inputs is appended).
         inputs:          List of (text, img_url) pairs — the benchmark dataset.
         lora_counts:     List of adapter counts to test, e.g. [1, 2, 4, 8].
                          Defaults to [1, 2, ..., len(all_lora_names)].
@@ -291,8 +285,7 @@ def benchmark_lora_sweep(
         loras = all_lora_names[:n]
         config = BenchmarkConfig(
             lora_names=loras,
-            system_prompt=system_prompt,
-            user_prompt=user_prompt,
+            build_prompt=build_prompt,
             max_tokens=max_tokens,
             temperature=temperature,
             concurrency=concurrency,
