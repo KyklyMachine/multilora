@@ -1,27 +1,28 @@
 """
-Offline multi-LoRA benchmark for vLLM (embedded `LLM` mode, no HTTP).
+Offline multi-LoRA benchmark for vLLM (embedded ``LLM`` mode, no HTTP).
 
-Submits every `(input, adapter)` pair to a single batched `LLM.chat` call,
-which fills vLLM's scheduler queue at once and lets its continuous-batching
-scheduler form the widest possible per-step batches. Returns one aggregate
-row per call — concatenate rows across runs to compare configurations.
+For each input, submits one ``LLM.chat`` call containing ``n_adapters``
+requests (same prompt, each with a different LoRA). This gives every input
+its own wall-clock time, from which per-input RPS is computed directly —
+no vLLM internal metrics needed.
 
-Reported metrics:
-    rps         — inputs per second (one input = one logical scoring,
-                  which internally produces `n_adapters` embeddings).
-    latency_*   — per-input end-to-end seconds: time from the first of an
-                  input's adapter requests arriving in the scheduler to
-                  the last one finishing. This is the wall-clock an
-                  upstream caller would observe.
+Reported metrics
+----------------
+rps          — aggregate inputs per second over the full run.
+rps_p50/p95/p99 — percentiles of per-input instantaneous RPS
+               (``1 / per_input_wall_time``).
+n_inputs     — total number of input pairs submitted.
+n_failed     — adapter responses that returned no output.
+wall_time_s  — total elapsed wall-clock time in seconds.
 
-Example:
+Example
+-------
+::
+
     from vllm import LLM, SamplingParams
     from vllm.lora.request import LoRARequest
     from vlm_inference import VLM_Runner
-    from lora_benchmark_offline import (
-        benchmark_loras_offline,
-        make_prompt_builder,
-    )
+    from lora_benchmark_offline import benchmark_loras_offline, make_prompt_builder
 
     llm = LLM(
         model="Qwen/Qwen3-VL-8B-Instruct",
@@ -53,124 +54,60 @@ Example:
         inputs=inputs,
         build_prompt=build_prompt,
         meta={"n_loras": len(adapters), "rank": 16, "target_modules": "qkv"},
+        verbose=True,
     )
 """
-
 from __future__ import annotations
 
 import logging
 import time
-from collections import defaultdict
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 from vllm import LLM, SamplingParams
 from vllm.lora.request import LoRARequest
-
 from vlm_inference import VLM_Runner
-
 
 __all__ = ["benchmark_loras_offline", "make_prompt_builder"]
 
 logger = logging.getLogger(__name__)
+
+# Reused across calls — only the prefill pass is needed for scoring.
+_DEFAULT_SAMPLING = SamplingParams(max_tokens=1, temperature=0.0)
 
 
 def make_prompt_builder(
     runner: VLM_Runner,
     project_tag: str,
 ) -> Callable[..., List[Dict[str, Any]]]:
-    """Configure `runner` for `project_tag` and return its prompt builder.
+    """Configure *runner* for *project_tag* and return its prompt builder.
 
-    The returned callable has signature `(text=..., img_url=...) -> messages`
-    and reuses the project's existing prompt-construction utilities, so
+    The returned callable has the signature ``(text=..., img_url=...) ->
+    messages`` and reuses the project's prompt-construction utilities, so
     benchmark requests are formed identically to production inference.
     """
     runner.set_project_tag(project_tag)
     return runner.build_prompt
 
 
-def _latency_stats(values: List[float]) -> Dict[str, float]:
-    """Return `latency_{mean,p50,p95,p99,max}_s` from a list of seconds."""
-    if not values:
-        return {
-            "latency_mean_s": 0.0,
-            "latency_p50_s": 0.0,
-            "latency_p95_s": 0.0,
-            "latency_p99_s": 0.0,
-            "latency_max_s": 0.0,
-        }
-    arr = np.asarray(values, dtype=float)
-    p50, p95, p99 = np.percentile(arr, [50, 95, 99])
+def _rps_percentiles(per_input_times: List[float]) -> Dict[str, Optional[float]]:
+    """Compute RPS percentiles from per-input wall-clock times.
+
+    Instantaneous RPS for each input is ``1 / wall_time``. Returns ``None``
+    values when the list is empty.
+    """
+    if not per_input_times:
+        return {"rps_p50": None, "rps_p95": None, "rps_p99": None}
+
+    instant_rps = 1.0 / np.asarray(per_input_times, dtype=float)
+    p50, p95, p99 = np.percentile(instant_rps, [50, 95, 99])
     return {
-        "latency_mean_s": float(arr.mean()),
-        "latency_p50_s": float(p50),
-        "latency_p95_s": float(p95),
-        "latency_p99_s": float(p99),
-        "latency_max_s": float(arr.max()),
+        "rps_p50": float(p50),
+        "rps_p95": float(p95),
+        "rps_p99": float(p99),
     }
-
-
-def _expand_requests(
-    inputs: List[Tuple[str, Optional[str]]],
-    adapters: List[LoRARequest],
-    build_prompt: Callable[..., List[Dict[str, Any]]],
-) -> Tuple[List[List[Dict[str, Any]]], List[LoRARequest], List[int]]:
-    """Cross-product `inputs × adapters` into three positionally-aligned lists.
-
-    Returns:
-        `(messages, lora_requests, input_index)` of length
-        `len(inputs) * len(adapters)`. `input_index[k]` records which input
-        request `k` came from, used later to group adapter responses by input.
-    """
-    per_input_messages = [
-        build_prompt(text=text, img_url=url) for text, url in inputs
-    ]
-    messages: List[List[Dict[str, Any]]] = []
-    lora_requests: List[LoRARequest] = []
-    input_index: List[int] = []
-    for idx, msgs in enumerate(per_input_messages):
-        for adapter in adapters:
-            messages.append(msgs)
-            lora_requests.append(adapter)
-            input_index.append(idx)
-    return messages, lora_requests, input_index
-
-
-def _collect_end_to_end(
-    outputs: List[Any],
-    input_index: List[int],
-) -> Tuple[List[float], int]:
-    """Per-input end-to-end latencies and the failure count.
-
-    End-to-end per input = `max(finished_time) - min(arrival_time)` across
-    that input's adapter requests, taken from vLLM's `RequestMetrics`. This
-    is the wall clock an upstream caller would observe waiting for all
-    adapter embeddings of one input.
-    """
-    grouped: Dict[int, List[Any]] = defaultdict(list)
-    n_failed = 0
-    for output, idx in zip(outputs, input_index):
-        if not output.outputs:
-            n_failed += 1
-            continue
-        grouped[idx].append(output)
-
-    end_to_end: List[float] = []
-    for outs in grouped.values():
-        usable = [
-            o.metrics
-            for o in outs
-            if o.metrics
-            and o.metrics.arrival_time is not None
-            and o.metrics.finished_time is not None
-        ]
-        if usable:
-            end_to_end.append(
-                max(m.finished_time for m in usable)
-                - min(m.arrival_time for m in usable)
-            )
-    return end_to_end, n_failed
 
 
 def benchmark_loras_offline(
@@ -180,65 +117,82 @@ def benchmark_loras_offline(
     build_prompt: Callable[..., List[Dict[str, Any]]],
     sampling_params: Optional[SamplingParams] = None,
     meta: Optional[Dict[str, Any]] = None,
+    verbose: bool = True,
 ) -> pd.DataFrame:
-    """Benchmark a multi-LoRA workload via vLLM's offline `LLM.chat`.
+    """Benchmark a multi-LoRA workload via vLLM's offline ``LLM.chat``.
 
-    Submits `len(inputs) * len(adapters)` chat requests in a single call so
-    vLLM's continuous-batching scheduler sees the entire workload at once.
+    For each input, issues one ``LLM.chat`` call with ``len(adapters)``
+    requests (same prompt, each paired with a different LoRA adapter).
+    Per-input wall-clock times are recorded directly, enabling RPS percentiles
+    without relying on vLLM's internal request metrics.
 
     Args:
-        llm: vLLM `LLM` started with `enable_lora=True` and
-            `max_loras >= len(adapters)`.
-        adapters: One `LoRARequest` per adapter; each must have a unique
-            `lora_int_id`.
-        inputs: List of `(text, img_url)` pairs.
-        build_prompt: Callable `(text=..., img_url=...) -> messages`. Use
-            `make_prompt_builder(runner, project_tag)` to obtain one
+        llm: vLLM ``LLM`` started with ``enable_lora=True`` and
+            ``max_loras >= len(adapters)``.
+        adapters: One ``LoRARequest`` per adapter; each must have a unique
+            ``lora_int_id``.
+        inputs: List of ``(text, img_url)`` pairs.
+        build_prompt: Callable ``(text=..., img_url=...) -> messages``. Use
+            ``make_prompt_builder(runner, project_tag)`` to obtain one
             consistent with the project's production prompt format.
-        sampling_params: Defaults to `SamplingParams(max_tokens=1,
-            temperature=0.0)` — only the prefill is needed for an embedding.
-        meta: Server-config attributes stamped into the output row
-            (e.g. `{"n_loras": 4, "rank": 16, "target_modules": "qkv"}`).
+        sampling_params: Defaults to ``SamplingParams(max_tokens=1,
+            temperature=0.0)`` — only the prefill pass is needed for scoring.
+        meta: Arbitrary key-value pairs stamped into the output row
+            (e.g. ``{"n_loras": 4, "rank": 16, "target_modules": "qkv"}``).
+        verbose: Emit INFO-level progress via the module logger and show a
+            tqdm progress bar over inputs.
 
     Returns:
-        Single-row DataFrame. Columns:
-            <meta keys you passed>,
-            rps,
-            latency_mean_s, latency_p50_s, latency_p95_s, latency_p99_s,
-            latency_max_s,
-            n_inputs, n_failed, wall_time_s.
+        Single-row :class:`pandas.DataFrame` with columns:
+        ``<meta keys>``, ``rps``, ``rps_p50``, ``rps_p95``, ``rps_p99``,
+        ``n_inputs``, ``n_failed``, ``wall_time_s``.
     """
-    sampling = sampling_params or SamplingParams(max_tokens=1, temperature=0.0)
-    messages, lora_requests, input_index = _expand_requests(
-        inputs, adapters, build_prompt
-    )
+    sampling = sampling_params or _DEFAULT_SAMPLING
 
-    logger.info(
-        "Offline batch: %d inputs x %d adapters = %d requests in a single LLM.chat call",
-        len(inputs),
-        len(adapters),
-        len(messages),
-    )
+    if verbose:
+        logger.info(
+            "Offline benchmark: %d inputs × %d adapters, %d calls total.",
+            len(inputs),
+            len(adapters),
+            len(inputs),
+        )
+
+    per_input_times: List[float] = []
+    n_failed = 0
 
     wall_start = time.perf_counter()
-    outputs = llm.chat(
-        messages=messages,
-        sampling_params=sampling,
-        lora_request=lora_requests,
-        use_tqdm=True,
-    )
-    wall_time = time.perf_counter() - wall_start
+    for text, img_url in tqdm(inputs, desc="Inputs", disable=not verbose):
+        prompt = build_prompt(text=text, img_url=img_url)
+        messages = [prompt] * len(adapters)
 
-    end_to_end, n_failed = _collect_end_to_end(outputs, input_index)
+        t0 = time.perf_counter()
+        outputs = llm.chat(
+            messages=messages,
+            sampling_params=sampling,
+            lora_request=adapters,
+            use_tqdm=False,
+        )
+        per_input_times.append(time.perf_counter() - t0)
+        n_failed += sum(1 for o in outputs if not o.outputs)
+
+    wall_time = time.perf_counter() - wall_start
     rps = len(inputs) / wall_time if wall_time > 0 else 0.0
+
+    if verbose:
+        logger.info(
+            "Done in %.2fs — %.2f inputs/s | %d failed / %d inputs.",
+            wall_time,
+            rps,
+            n_failed,
+            len(inputs),
+        )
 
     row: Dict[str, Any] = {
         **(meta or {}),
         "rps": rps,
-        **_latency_stats(end_to_end),
+        **_rps_percentiles(per_input_times),
         "n_inputs": len(inputs),
         "n_failed": n_failed,
         "wall_time_s": wall_time,
     }
     return pd.DataFrame([row])
-    
