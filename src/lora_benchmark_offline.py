@@ -69,7 +69,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from openai import AsyncOpenAI
-from tqdm import tqdm
+from tqdm.asyncio import tqdm as atqdm
 from vlm_inference import VLM_Runner
 
 __all__ = ["benchmark_loras_server", "make_prompt_builder"]
@@ -132,13 +132,6 @@ async def _run_benchmark(
 
     input_finish: Dict[int, float] = {}
     n_failed = 0
-    lock = asyncio.Lock()
-    pbar = tqdm(
-        total=n_inputs * len(adapter_names),
-        desc="Requests",
-        unit="req",
-        disable=not verbose,
-    )
 
     async def process_one(input_idx: int, adapter_name: str) -> None:
         nonlocal n_failed
@@ -152,29 +145,33 @@ async def _run_benchmark(
             finish_time = time.perf_counter()
             has_output = bool(response.choices)
         except Exception as exc:
-            logger.debug("Request failed (input=%d, adapter=%s): %s", input_idx, adapter_name, exc)
+            logger.debug(
+                "Request failed (input=%d, adapter=%s): %s",
+                input_idx, adapter_name, exc,
+            )
             finish_time = time.perf_counter()
             has_output = False
 
-        async with lock:
-            if not has_output:
-                n_failed += 1
-            else:
-                input_finish[input_idx] = max(
-                    input_finish.get(input_idx, 0.0), finish_time
-                )
-            pbar.update(1)
+        if not has_output:
+            n_failed += 1
+        else:
+            input_finish[input_idx] = max(
+                input_finish.get(input_idx, 0.0), finish_time
+            )
 
     wall_start = time.perf_counter()
-    await asyncio.gather(
+    await atqdm.gather(
         *(
             process_one(idx, adapter_name)
             for idx in range(n_inputs)
             for adapter_name in adapter_names
-        )
+        ),
+        desc="Requests",
+        unit="req",
+        total=n_inputs * len(adapter_names),
+        disable=not verbose,
     )
     wall_time = time.perf_counter() - wall_start
-    pbar.close()
 
     per_input_times = [
         input_finish[i] - wall_start
