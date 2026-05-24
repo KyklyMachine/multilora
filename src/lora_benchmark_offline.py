@@ -47,7 +47,8 @@ Example
     build_prompt = make_prompt_builder(runner, "ml_audit_sgc_photo_title_mismatch")
     inputs = list(zip(df["text_value"], df["local_image_path"]))
 
-    row = benchmark_loras_server(
+    # In Jupyter:
+    row = await benchmark_loras_server(
         client=client,
         adapter_names=["a1", "a2"],          # must match --lora-modules names
         inputs=inputs,
@@ -55,10 +56,12 @@ Example
         meta={"n_loras": 2, "rank": 16, "target_modules": "qkv"},
         verbose=True,
     )
+
+    # In a script:
+    # row = asyncio.run(benchmark_loras_server(client=client, ...))
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -181,7 +184,7 @@ async def _run_benchmark(
     return per_input_times, wall_time, n_failed
 
 
-def benchmark_loras_server(
+async def benchmark_loras_server(
     client: AsyncOpenAI,
     adapter_names: List[str],
     inputs: List[Tuple[str, Optional[str]]],
@@ -218,6 +221,11 @@ def benchmark_loras_server(
         Single-row :class:`pandas.DataFrame` with columns:
         ``<meta keys>``, ``rps``, ``rps_p50``, ``rps_p95``, ``rps_p99``,
         ``n_inputs``, ``n_failed``, ``wall_time_s``.
+
+    Note:
+        This is a coroutine — call it with ``await`` in Jupyter or inside
+        another async context. In a plain script use
+        ``asyncio.run(benchmark_loras_server(...))``.
     """
     if verbose:
         logger.info(
@@ -227,11 +235,9 @@ def benchmark_loras_server(
             len(inputs) * len(adapter_names),
         )
 
-    per_input_times, wall_time, n_failed = asyncio.run(
-        _run_benchmark(
-            client, inputs, adapter_names, build_prompt,
-            max_tokens, temperature, verbose,
-        )
+    per_input_times, wall_time, n_failed = await _run_benchmark(
+        client, inputs, adapter_names, build_prompt,
+        max_tokens, temperature, verbose,
     )
 
     rps = len(inputs) / wall_time if wall_time > 0 else 0.0
