@@ -74,7 +74,7 @@ class _Result:
 
 
 # ---------------------------------------------------------------------------
-# Single request
+# Requests
 # ---------------------------------------------------------------------------
 
 
@@ -112,6 +112,29 @@ async def _send_one(
                 latency=time.perf_counter() - t0,
                 success=False,
             )
+
+
+async def _send_sample(
+    client: AsyncOpenAI,
+    sem: Semaphore,
+    lora_names: List[str],
+    messages: List[Dict],
+    max_tokens: int,
+    temperature: float,
+    n_repeats: int,
+) -> List[_Result]:
+    """Fire one sample to all LoRA adapters concurrently (× n_repeats).
+
+    This is the "user batch": vLLM receives all lora_names × n_repeats requests
+    for this sample simultaneously and merges them into its own internal batches.
+    """
+    return list(
+        await asyncio.gather(*[
+            _send_one(client, sem, lora_name, messages, max_tokens, temperature)
+            for lora_name in lora_names
+            for _ in range(n_repeats)
+        ])
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -187,33 +210,36 @@ async def run_benchmark(
         per_lora_df:  DataFrame with one row per LoRA adapter.
     """
     sem = Semaphore(config.concurrency)
+    n_loras = len(config.lora_names)
+    n_samples = len(inputs)
 
-    tasks = [
-        _send_one(
+    # One task per sample; each task fires all LoRAs concurrently internally.
+    # tqdm tracks sample-level progress, not individual requests.
+    sample_tasks = [
+        _send_sample(
             client=client,
             sem=sem,
-            lora_name=lora_name,
+            lora_names=config.lora_names,
             messages=config.build_prompt(text=text, img_url=img_url),
             max_tokens=config.max_tokens,
             temperature=config.temperature,
+            n_repeats=config.n_repeats,
         )
         for text, img_url in inputs
-        for lora_name in config.lora_names
-        for _ in range(config.n_repeats)
     ]
 
-    n_loras = len(config.lora_names)
-    n_samples = len(inputs)
     logger.info(
-        f"Firing {len(tasks)} requests "
+        f"Firing {n_samples * n_loras * config.n_repeats} requests "
         f"({n_samples} samples × {n_loras} LoRAs × {config.n_repeats} repeats)"
     )
 
     t0 = time.perf_counter()
-    results: List[_Result] = await tqdm_asyncio.gather(
-        *tasks, desc=f"n_loras={n_loras}"
+    per_sample: List[List[_Result]] = await tqdm_asyncio.gather(
+        *sample_tasks, desc=f"n_loras={n_loras}"
     )
     elapsed = time.perf_counter() - t0
+
+    results: List[_Result] = [r for sample in per_sample for r in sample]
 
     # Aggregate stats
     global_stats = _stats_row(results, elapsed)
